@@ -1,6 +1,6 @@
-streamlit>=1.38.0
+streamlit
 akshare>=1.18.0
-pandas>=2.2.0
-numpy>=1.26.0
-requests>=2.32.0
+pandas
+numpy
 python-dateutil
+requests
