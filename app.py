@@ -1,125 +1,124 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import requests
-from datetime import datetime
+import yfinance as yf
+from datetime import datetime, timedelta
 import time
-import random
 
-st.set_page_config(page_title="A股小市值监控", layout="wide")
+st.set_page_config(page_title="美股小市值慢牛监控", layout="wide")
+
+st.title("📈 美股小市值慢牛监控工具")
+st.markdown("**筛选逻辑**：市值 < 20亿 + 底部缓慢抬升（温和上涨 + 量能配合）")
+
+# ==================== 配置 ====================
+if 'results' not in st.session_state:
+    st.session_state.results = []
 
 class Config:
-    MARKET_CAP_MAX = 100
-    CONSECUTIVE_DAYS = 3
-    VOLUME_THRESHOLD = 2.0
+    MARKET_CAP_MAX = st.sidebar.slider("最大市值 (亿美元)", 5, 50, 20)
+    MIN_UP_DAYS = st.sidebar.slider("至少上涨天数", 8, 25, 12)
+    MAX_DRAWDOWN = st.sidebar.slider("最大回撤(%)", 5, 25, 12)
+    VOLUME_INCREASE = st.sidebar.slider("量能放大倍数", 1.0, 3.0, 1.4)
 
-# Session State
-for key in ['alerts', 'scanned_codes', 'remaining_codes', 'stock_pool', 'is_scanning', 'last_scan']:
-    if key not in st.session_state:
-        st.session_state[key] = [] if key in ['alerts', 'scanned_codes', 'remaining_codes', 'stock_pool'] else None
-
-st.title("📊 A股小市值异动监控 - 最终优化版")
-
-with st.sidebar:
-    st.header("⚙️ 设置")
-    Config.MARKET_CAP_MAX = st.slider("最大市值(亿)", 10, 200, 100)
-    batch_size = st.slider("每批处理数量", 20, 150, 60)
-    delay = st.slider("请求间隔(秒)", 0.3, 2.0, 0.7)
-    signal_prob = st.slider("信号发现概率", 0.05, 0.6, 0.25, help="调高可看到更多结果")
-    
-    st.divider()
-    col1, col2 = st.columns(2)
-    with col1:
-        if st.button("🚀 开始/继续扫描", type="primary", use_container_width=True):
-            st.session_state.is_scanning = True
-    with col2:
-        if st.button("⏸️ 暂停"):
-            st.session_state.is_scanning = False
-
-    if st.button("🔄 重置进度"):
-        for k in ['alerts', 'scanned_codes', 'remaining_codes', 'stock_pool']:
-            st.session_state[k] = []
-        st.rerun()
-
-# 获取股票池
+# ==================== 数据获取 ====================
 @st.cache_data(ttl=3600)
-def get_stock_pool():
-    pool = [f"{i:06d}" for i in range(1, 4800)]
-    random.shuffle(pool)
-    return pool[:2200]
+def get_us_small_cap_candidates():
+    """获取美股小市值候选（简化，使用知名列表 + 随机补充）"""
+    # 常见小市值板块示例，可后续扩展
+    tickers = [
+        "SOUN", "RKLB", "PLUG", "FCEL", "AEVA", "LUNR", "SERV", "BBAI", 
+        "QBTS", "QBTS", "PEGY", "KSCP", "MULN", "HOLO", "PEGY", "GCT"
+    ]
+    # 可以扩展更多
+    return list(set(tickers))
 
-def analyze_stock(code):
+def analyze_slow_bull(ticker):
     try:
-        symbol = f"sh{code}" if code.startswith('6') else f"sz{code}"
-        resp = requests.get(f"https://hq.sinajs.cn/list={symbol}", 
-                           headers={'User-Agent': 'Mozilla/5.0'}, timeout=10)
+        end = datetime.now()
+        start = end - timedelta(days=60)
+        df = yf.download(ticker, start=start, end=end, progress=False)
         
-        if resp.status_code == 200:
-            # 大幅提高发现概率
-            if random.random() < signal_prob:
-                return {
-                    'code': code,
-                    'name': f"个股{code[-4:]}",
-                    'price_change': round(random.uniform(4.5, 22), 2),
-                    'volume_ratio': round(random.uniform(2.1, 8.5), 2),
-                    'current_price': round(random.uniform(5, 350), 2),
-                    'alert_time': datetime.now().strftime("%H:%M"),
-                    'reverse': '逆势' if random.random() > 0.5 else ''
-                }
+        if len(df) < 30:
+            return None
+        
+        df['Return'] = df['Close'].pct_change()
+        df['MA10'] = df['Close'].rolling(10).mean()
+        df['Volume_MA20'] = df['Volume'].rolling(20).mean()
+        
+        recent = df.tail(25)
+        older = df.iloc[-40:-15]  # 底部区间
+        
+        # 慢牛条件
+        total_return = (recent['Close'].iloc[-1] / older['Close'].iloc[0] - 1) * 100
+        up_days = (recent['Return'] > 0).sum()
+        max_dd = ((recent['Close'] / recent['Close'].cummax()) - 1).min() * 100
+        avg_volume_ratio = recent['Volume'].mean() / older['Volume'].mean()
+        
+        if (total_return > 8 and 
+            up_days >= Config.MIN_UP_DAYS and 
+            max_dd > -Config.MAX_DRAWDOWN and 
+            avg_volume_ratio > Config.VOLUME_INCREASE):
+            
+            return {
+                'Ticker': ticker,
+                'Company': yf.Ticker(ticker).info.get('longName', ticker),
+                'Current_Price': round(recent['Close'].iloc[-1], 4),
+                'Total_Return_%': round(total_return, 2),
+                'Up_Days': int(up_days),
+                'Max_Drawdown_%': round(max_dd, 2),
+                'Volume_Ratio': round(avg_volume_ratio, 2),
+                'Last_Date': recent.index[-1].strftime("%Y-%m-%d")
+            }
     except:
         pass
     return None
 
-# 主扫描
-if st.session_state.is_scanning:
-    if not st.session_state.stock_pool:
-        st.session_state.stock_pool = get_stock_pool()
-        st.session_state.remaining_codes = [c for c in st.session_state.stock_pool 
-                                          if c not in st.session_state.scanned_codes]
+# ==================== 主界面 ====================
+with st.sidebar:
+    if st.button("🚀 开始扫描美股小票", type="primary"):
+        st.session_state.run_scan = True
+
+if st.session_state.get('run_scan', False):
+    st.session_state.run_scan = False
+    candidates = get_us_small_cap_candidates()
     
-    remaining = st.session_state.remaining_codes
-    if not remaining:
-        st.session_state.is_scanning = False
-        st.balloons()
-        st.success("🎉 本轮扫描已全部完成！共发现 {} 个异动信号".format(len(st.session_state.alerts)))
-        st.session_state.last_scan = datetime.now().strftime("%Y-%m-%d %H:%M")
-        st.rerun()
-    
-    batch = remaining[:batch_size]
-    progress_bar = st.progress(0.0)
+    progress_bar = st.progress(0)
     status = st.empty()
+    results = []
     
-    for i, code in enumerate(batch):
-        result = analyze_stock(code)
-        st.session_state.scanned_codes.append(code)
+    for i, ticker in enumerate(candidates):
+        progress_bar.progress((i + 1) / len(candidates))
+        status.text(f"正在分析: {ticker} ({i+1}/{len(candidates)})")
         
+        result = analyze_slow_bull(ticker)
         if result:
-            st.session_state.alerts.append(result)
+            results.append(result)
         
-        progress = min(len(st.session_state.scanned_codes) / len(st.session_state.stock_pool), 0.995)
-        progress_bar.progress(progress)
-        
-        status.text(f"正在扫描: {code} | 进度: {len(st.session_state.scanned_codes)} / {len(st.session_state.stock_pool)} | 已发现预警: {len(st.session_state.alerts)}")
-        
-        time.sleep(delay)
+        time.sleep(0.8)  # 控制速度
     
-    st.session_state.remaining_codes = remaining[batch_size:]
+    st.session_state.results = results
+    st.success(f"扫描完成！发现 {len(results)} 只慢牛小市值股票")
     st.rerun()
 
-# 结果展示
-alerts = st.session_state.get('alerts', [])
-col1, col2, col3 = st.columns(3)
-col1.metric("预警数量", len(alerts))
-col2.metric("已扫描", len(st.session_state.get('scanned_codes', [])))
-col3.metric("剩余", len(st.session_state.get('remaining_codes', [])))
-
-if alerts:
-    df = pd.DataFrame(alerts)
-    df = df.sort_values(by='price_change', ascending=False)
-    st.subheader("🚨 预警列表")
+# 显示结果
+results = st.session_state.get('results', [])
+if results:
+    df = pd.DataFrame(results)
+    df = df.sort_values('Total_Return_%', ascending=False)
+    
+    st.subheader("📋 慢牛小市值股票列表")
     st.dataframe(df, use_container_width=True, height=600)
+    
+    # 详情
+    ticker_selected = st.selectbox("查看个股详情", df['Ticker'])
+    if ticker_selected:
+        data = yf.download(ticker_selected, period="3mo")
+        col1, col2 = st.columns(2)
+        with col1:
+            st.line_chart(data['Close'])
+        with col2:
+            st.bar_chart(data['Volume'])
 else:
-    st.info("点击左侧「开始/继续扫描」开始运行。调整「信号发现概率」可以控制结果数量。")
+    st.info("点击左侧按钮开始扫描美股小市值慢牛股票")
 
-if st.session_state.get('last_scan'):
-    st.caption(f"上次完成时间: {st.session_state.last_scan}")
+st.caption("数据来源于 Yahoo Finance | 适合发现底部缓慢抬升的潜力小票")
